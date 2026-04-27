@@ -1,0 +1,95 @@
+name: Deploy Medical Wallet
+
+on:
+  push:
+    branches: [main, staging]
+  pull_request:
+    branches: [main]
+
+env:
+  NODE_VERSION: '20'
+  AZURE_RG: ${{ vars.AZURE_RG }}
+  AZURE_APP_NAME: ${{ vars.AZURE_APP_NAME }}
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Lint, type-check, security audit, build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run type-check
+      - run: npm audit --audit-level=high
+        continue-on-error: false
+      - run: npx prisma generate
+      - run: npm run build
+        env:
+          DATABASE_URL: 'postgresql://placeholder@localhost:5432/db'
+          NEXTAUTH_SECRET: placeholder
+          NEXTAUTH_URL: http://localhost:3000
+
+  deploy:
+    name: Deploy to Azure App Service
+    needs: test
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/staging')
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ github.ref == 'refs/heads/main' && 'production' || 'staging' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+      - run: npm ci --omit=dev=false
+      - run: npx prisma generate
+      - run: npm run build
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          NEXTAUTH_SECRET: ${{ secrets.NEXTAUTH_SECRET }}
+          NEXTAUTH_URL: ${{ secrets.NEXTAUTH_URL }}
+
+      - name: Run Prisma migrations (deploy)
+        run: npx prisma migrate deploy
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy to App Service (slot=staging)
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ env.AZURE_APP_NAME }}
+          slot-name: staging
+          package: .
+
+      - name: Health check on staging slot
+        run: |
+          for i in $(seq 1 30); do
+            url="https://${{ env.AZURE_APP_NAME }}-staging.azurewebsites.net/api/health"
+            code=$(curl -s -o /dev/null -w "%{http_code}" "$url")
+            if [ "$code" = "200" ]; then echo "Healthy"; exit 0; fi
+            sleep 5
+          done
+          echo "Health check failed"; exit 1
+
+      - name: Swap staging → production
+        if: github.ref == 'refs/heads/main'
+        run: |
+          az webapp deployment slot swap \
+            --resource-group ${{ env.AZURE_RG }} \
+            --name ${{ env.AZURE_APP_NAME }} \
+            --slot staging --target-slot production
